@@ -1,0 +1,498 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <MQTT.h>
+#include <ArduinoJson.h>
+
+// ================= PIN CONFIG =================
+#define SENSOR_PIN   23
+#define SERVO_PIN    18
+#define BUZZER_PIN   32
+
+#define RESET_PIN    27
+#define PENDOWN_PIN  26
+#define PENUP_PIN    25
+#define DASH_PIN     33
+
+// ================= OBJECTS =================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Servo penServo;
+
+// ================= WIFI / MQTT =================
+const char ssid[] = "satotie";
+const char pass[] = "tie123456";
+
+const char mqtt_broker[] = "broker.hivemq.com";
+const int MQTT_PORT = 1883;
+const char mqtt_client_id[] = "esp32_group7_control_v4";
+
+const char topic_cmd[] = "group7/cmd";
+const char topic_status[] = "group7/status";
+
+WiFiClient net;
+MQTTClient client(1024);
+
+// ================= COUNTER =================
+volatile unsigned long countWhite = 0;
+volatile unsigned long lastInterruptTime = 0;
+
+// ================= SETTINGS =================
+float wheelCircumference = 39.3128;
+int pulsePerRound = 36;
+unsigned long debounceTime = 250; // us
+
+int penUpAngle = 0;
+int penDownAngle = 180;
+
+// ================= STATES =================
+bool penIsDown = false;
+bool isAutoSolidMode = false;
+bool isDashedMode = false;
+
+// false = ครั้งถัดไปเริ่ม SOLID
+// true  = ครั้งถัดไปเริ่ม DASH
+bool nextModeIsDash = false;
+
+float solidTotalDistance = 20.0;
+float dashedTotalDistance = 50.0;
+float dashSegmentLength = 5.0;
+
+float solidStartDistance = 0.0;
+float dashedStartDistance = 0.0;
+float nextDashToggleDistance = 0.0;
+
+// ================= BUTTON TIMING =================
+unsigned long lastResetPress = 0;
+unsigned long lastPenDownPress = 0;
+unsigned long lastPenUpPress = 0;
+unsigned long lastDashPress = 0;
+const unsigned long buttonDebounceMs = 250;
+
+// ================= TIMING =================
+unsigned long lastDisplay = 0;
+unsigned long lastPublish = 0;
+
+// =================================================
+// ISR
+// =================================================
+void IRAM_ATTR countPulse() {
+  unsigned long now = micros();
+  if (now - lastInterruptTime > debounceTime) {
+    countWhite++;
+    lastInterruptTime = now;
+  }
+}
+
+// =================================================
+// BUZZER
+// =================================================
+void buzzerOn() { digitalWrite(BUZZER_PIN, HIGH); }
+void buzzerOff() { digitalWrite(BUZZER_PIN, LOW); }
+
+void beepShort() {
+  buzzerOn();
+  delay(80);
+  buzzerOff();
+  delay(40);
+}
+
+void beepLong() {
+  buzzerOn();
+  delay(500);
+  buzzerOff();
+  delay(80);
+}
+
+// =================================================
+// PEN
+// =================================================
+void penUp() {
+  penServo.write(penUpAngle);
+  penIsDown = false;
+}
+
+void penDown() {
+  penServo.write(penDownAngle);
+  penIsDown = true;
+}
+
+// =================================================
+// COUNTER / DISTANCE
+// =================================================
+void resetCounter() {
+  noInterrupts();
+  countWhite = 0;
+  lastInterruptTime = 0;
+  interrupts();
+}
+
+unsigned long getCurrentCount() {
+  unsigned long currentCount;
+  noInterrupts();
+  currentCount = countWhite;
+  interrupts();
+  return currentCount;
+}
+
+float getCurrentDistance() {
+  unsigned long currentCount = getCurrentCount();
+  return (currentCount * wheelCircumference) / pulsePerRound;
+}
+
+// =================================================
+// MODES
+// =================================================
+void stopAllModes() {
+  isAutoSolidMode = false;
+  isDashedMode = false;
+}
+
+void startSolidMode(float currentDistance) {
+  stopAllModes();
+  isAutoSolidMode = true;
+  solidStartDistance = currentDistance;
+  penDown();
+  Serial.println("SOLID MODE START");
+}
+
+void startDashedMode(float currentDistance) {
+  if (dashedTotalDistance <= 0 || dashSegmentLength <= 0) return;
+
+  stopAllModes();
+  isDashedMode = true;
+  dashedStartDistance = currentDistance;
+  nextDashToggleDistance = dashSegmentLength;
+  penDown();
+
+  Serial.println("DASH MODE START");
+}
+
+String getModeString() {
+  if (isDashedMode) return "DASH";
+  if (isAutoSolidMode) return "SOLID";
+  return "IDLE";
+}
+
+String getNextModeString() {
+  return nextModeIsDash ? "DASH" : "SOLID";
+}
+
+// =================================================
+// WIFI / MQTT
+// =================================================
+void connectWiFi() {
+  Serial.print("Connecting WiFi");
+  WiFi.begin(ssid, pass);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+
+  Serial.println("\nWiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+void connectMQTT() {
+  Serial.print("Connecting MQTT");
+  while (!client.connect(mqtt_client_id)) {
+    Serial.print(".");
+    delay(1000);
+  }
+  Serial.println("\nMQTT connected");
+  client.subscribe(topic_cmd);
+}
+
+void publishStatus() {
+  StaticJsonDocument<256> doc;
+  doc["count"] = getCurrentCount();
+  doc["distance"] = getCurrentDistance();
+  doc["pen"] = penIsDown ? "DOWN" : "UP";
+  doc["mode"] = getModeString();
+  doc["nextMode"] = getNextModeString();
+  doc["solidTarget"] = solidTotalDistance;
+  doc["dashSegment"] = dashSegmentLength;
+  doc["dashTotal"] = dashedTotalDistance;
+
+  String payload;
+  serializeJson(doc, payload);
+  client.publish(topic_status, payload);
+}
+
+// =================================================
+// MQTT CALLBACK
+// =================================================
+void messageReceived(String &topic, String &payload) {
+  Serial.println("Incoming: " + topic + " -> " + payload);
+
+  StaticJsonDocument<256> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.println("JSON parse failed");
+    return;
+  }
+
+  String cmd = doc["cmd"] | "";
+  float currentDistance = getCurrentDistance();
+
+  if (cmd == "set_solid") {
+    float distance = doc["distance"] | solidTotalDistance;
+    if (distance > 0) {
+      solidTotalDistance = distance;
+      Serial.print("solidTotalDistance updated: ");
+      Serial.println(solidTotalDistance);
+    }
+  }
+  else if (cmd == "set_dash") {
+    float segment = doc["segment"] | dashSegmentLength;
+    float total = doc["total"] | dashedTotalDistance;
+
+    if (segment > 0) dashSegmentLength = segment;
+    if (total > 0) dashedTotalDistance = total;
+
+    Serial.print("dashSegmentLength updated: ");
+    Serial.println(dashSegmentLength);
+    Serial.print("dashedTotalDistance updated: ");
+    Serial.println(dashedTotalDistance);
+  }
+  else if (cmd == "start_solid") {
+    startSolidMode(currentDistance);
+  }
+  else if (cmd == "start_dash") {
+    startDashedMode(currentDistance);
+  }
+  else if (cmd == "pen_up") {
+    stopAllModes();
+    penUp();
+  }
+  else if (cmd == "pen_down") {
+    penDown(); // ลงเฉย ๆ
+  }
+  else if (cmd == "reset") {
+    stopAllModes();
+    resetCounter();
+    penUp();
+
+    solidTotalDistance = 20.0;
+    dashedTotalDistance = 50.0;
+    dashSegmentLength = 5.0;
+    nextModeIsDash = false;
+  }
+  else if (cmd == "idle") {
+    stopAllModes();
+    penUp();
+  }
+
+  publishStatus();
+}
+
+// =================================================
+// LCD
+// =================================================
+void updateLCD(unsigned long currentCount, float distance) {
+  lcd.setCursor(0, 0);
+  lcd.print("Cnt:");
+  lcd.print(currentCount);
+  lcd.print("     ");
+
+  lcd.setCursor(0, 1);
+  lcd.print(distance, 2);
+  lcd.print("cm ");
+  lcd.print(penIsDown ? "DN" : "UP");
+
+  if (isDashedMode) lcd.print(" D");
+  else if (isAutoSolidMode) lcd.print(" S");
+  else lcd.print(" I");
+
+  lcd.print(" ");
+}
+
+// =================================================
+// HARDWARE BUTTONS
+// =================================================
+void handleHardwareButtons(float currentDistance) {
+  // RESET
+  if (digitalRead(RESET_PIN) == LOW) {
+    if (millis() - lastResetPress > buttonDebounceMs) {
+      lastResetPress = millis();
+
+      stopAllModes();
+      resetCounter();
+      penUp();
+
+      solidTotalDistance = 20.0;
+      dashedTotalDistance = 50.0;
+      dashSegmentLength = 5.0;
+      nextModeIsDash = false;
+
+      beepLong();
+      Serial.println("HARDWARE RESET");
+      publishStatus();
+    }
+  }
+
+  // PEN DOWN -> ลงปากกาเฉย ๆ
+  if (digitalRead(PENDOWN_PIN) == LOW) {
+    if (millis() - lastPenDownPress > buttonDebounceMs) {
+      lastPenDownPress = millis();
+
+      penDown();
+      beepShort();
+      Serial.println("HARDWARE PEN DOWN ONLY");
+      publishStatus();
+    }
+  }
+
+  // PEN UP -> ยกปากกา + stop mode
+  if (digitalRead(PENUP_PIN) == LOW) {
+    if (millis() - lastPenUpPress > buttonDebounceMs) {
+      lastPenUpPress = millis();
+
+      stopAllModes();
+      penUp();
+      beepShort();
+      Serial.println("HARDWARE PEN UP");
+      publishStatus();
+    }
+  }
+
+  // MODE BUTTON -> สลับ SOLID / DASH และเริ่มโหมด
+  if (digitalRead(DASH_PIN) == LOW) {
+    if (millis() - lastDashPress > buttonDebounceMs) {
+      lastDashPress = millis();
+
+      if (nextModeIsDash) {
+        startDashedMode(currentDistance);
+        Serial.println("HARDWARE MODE -> DASH");
+      } else {
+        startSolidMode(currentDistance);
+        Serial.println("HARDWARE MODE -> SOLID");
+      }
+
+      nextModeIsDash = !nextModeIsDash;
+
+      beepShort();
+      publishStatus();
+    }
+  }
+}
+
+// =================================================
+// SETUP
+// =================================================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(SENSOR_PIN, INPUT_PULLUP);
+  pinMode(RESET_PIN, INPUT_PULLUP);
+  pinMode(PENDOWN_PIN, INPUT_PULLUP);
+  pinMode(PENUP_PIN, INPUT_PULLUP);
+  pinMode(DASH_PIN, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  lcd.init();
+  lcd.backlight();
+
+  penServo.setPeriodHertz(50);
+  penServo.attach(SERVO_PIN, 500, 2400);
+
+  penUp();
+  delay(500);
+
+  lcd.setCursor(0, 0);
+  lcd.print("Ready");
+
+  attachInterrupt(digitalPinToInterrupt(SENSOR_PIN), countPulse, CHANGE);
+
+  connectWiFi();
+  client.begin(mqtt_broker, MQTT_PORT, net);
+  client.onMessage(messageReceived);
+  connectMQTT();
+
+  publishStatus();
+}
+
+// =================================================
+// LOOP
+// =================================================
+void loop() {
+  float distance = getCurrentDistance();
+
+  client.loop();
+  delay(10);
+
+  if (!client.connected()) {
+    connectMQTT();
+  }
+
+  handleHardwareButtons(distance);
+
+  // ===== SOLID MODE =====
+  if (isAutoSolidMode) {
+    float traveled = distance - solidStartDistance;
+    if (traveled >= solidTotalDistance) {
+      stopAllModes();
+      penUp();
+      beepLong();
+      Serial.println("SOLID MODE DONE");
+      publishStatus();
+    }
+  }
+
+  // ===== DASH MODE =====
+  if (isDashedMode) {
+    float traveled = distance - dashedStartDistance;
+
+    if (traveled >= dashedTotalDistance) {
+      stopAllModes();
+      penUp();
+      beepLong();
+      Serial.println("DASH MODE DONE");
+      publishStatus();
+    }
+    else if (traveled >= nextDashToggleDistance) {
+      if (penIsDown) penUp();
+      else penDown();
+
+      beepShort();
+      nextDashToggleDistance += dashSegmentLength;
+      publishStatus();
+    }
+  }
+
+  // ===== SERIAL + LCD =====
+  if (millis() - lastDisplay >= 200) {
+    lastDisplay = millis();
+
+    unsigned long currentCount = getCurrentCount();
+
+    Serial.print("Count: ");
+    Serial.print(currentCount);
+    Serial.print("  Distance: ");
+    Serial.print(distance, 2);
+    Serial.print(" cm  Pen: ");
+    Serial.print(penIsDown ? "DOWN" : "UP");
+    Serial.print("  Mode: ");
+    Serial.print(getModeString());
+    Serial.print("  NextMode: ");
+    Serial.print(getNextModeString());
+    Serial.print("  SolidTarget: ");
+    Serial.print(solidTotalDistance);
+    Serial.print("  DashSeg: ");
+    Serial.print(dashSegmentLength);
+    Serial.print("  DashTotal: ");
+    Serial.println(dashedTotalDistance);
+
+    updateLCD(currentCount, distance);
+  }
+
+  // ===== STATUS PUBLISH =====
+  if (millis() - lastPublish >= 100) {
+    lastPublish = millis();
+    publishStatus();
+  }
+}
